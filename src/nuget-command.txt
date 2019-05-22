@@ -1,0 +1,5 @@
+nuget pack -Properties Configuration=Release
+ 
+// see https://stackoverflow.com/questions/49074072/why-is-nuget-exe-pack-ignoring-the-configuration-release-parameter
+
+// https://stackoverflow.com/questions/45815070/error-nu5012-nuget-pack-unable-to-find-path-bin-release-myproject-bin-releas

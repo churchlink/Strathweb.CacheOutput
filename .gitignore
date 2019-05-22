@@ -2,6 +2,7 @@
 [Bb]in/
 [Oo]bj/
 .vs/
+*.nupkg
 
 # mstest test results
 TestResults
