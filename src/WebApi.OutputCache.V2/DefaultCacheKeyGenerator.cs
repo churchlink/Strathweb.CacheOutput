@@ -4,31 +4,20 @@ using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Web.Http.Controllers;
+using WebApi.OutputCache.Core;
 
 namespace WebApi.OutputCache.V2
 {
     public class DefaultCacheKeyGenerator : ICacheKeyGenerator
     {
-        public virtual string MakeCacheKey(HttpActionContext context, MediaTypeHeaderValue mediaType, bool excludeQueryString = false)
+        public virtual string MakeCacheKey(HttpActionContext context, MediaTypeHeaderValue mediaType, bool excludeQueryString = false, string[] baseKeyCacheArgs = null)
         {
-            var key = MakeBaseKey(context);
-            var parameters = FormatParameters(context, excludeQueryString);
+            var basekey = BaseCacheKeyGeneratorWebApi.GetKey(context, baseKeyCacheArgs);
+            var actionParameters = context.ActionArguments.Where(x => x.Value != null)
+                .Select(x => x.Key + "=" + GetValue(x.Value)).ToArray();
 
-            return string.Format("{0}{1}:{2}", key, parameters, mediaType);
-        }
-
-        protected virtual string MakeBaseKey(HttpActionContext context)
-        {
-            var controller = context.ControllerContext.ControllerDescriptor.ControllerType.FullName;
-            var action = context.ActionDescriptor.ActionName;
-            return context.Request.GetConfiguration().CacheOutputConfiguration().MakeBaseCachekey(controller, action);
-        }
-
-        protected virtual string FormatParameters(HttpActionContext context, bool excludeQueryString)
-        {
-            var actionParameters = context.ActionArguments.Where(x => x.Value != null).Select(x => x.Key + "=" + GetValue(x.Value));
-
-            string parameters;
+            // key renamed: basekey, parameters renamed actionParameters
+            string parameters = null;
 
             if (!excludeQueryString)
             {
@@ -37,7 +26,7 @@ namespace WebApi.OutputCache.V2
                            .Where(x => x.Key.ToLower() != "callback")
                            .Select(x => x.Key + "=" + x.Value);
                 var parametersCollections = actionParameters.Union(queryStringParameters);
-                parameters = "-" + string.Join("&", parametersCollections);
+                parameters = string.Join("&", parametersCollections);
 
                 var callbackValue = GetJsonpCallback(context.Request);
                 if (!string.IsNullOrWhiteSpace(callbackValue))
@@ -49,16 +38,19 @@ namespace WebApi.OutputCache.V2
                     if (parameters.EndsWith("&")) parameters = parameters.TrimEnd('&');
                 }
             }
-            else
+            else if (actionParameters.NotNulle())
             {
-                parameters = "-" + string.Join("&", actionParameters);
+                parameters = string.Join("&", actionParameters);
             }
 
-            if (parameters == "-") parameters = string.Empty;
-            return parameters;
+            if (parameters == null) parameters = string.Empty;
+
+            // baseKey is now separated from the rest by a ':' not a dash '-', to make the baseKey more evident
+            string cachekey = $"{basekey}:{parameters}:{mediaType.MediaType}".ToLower();
+            return cachekey;
         }
 
-        private string GetJsonpCallback(HttpRequestMessage request)
+        public virtual string GetJsonpCallback(HttpRequestMessage request)
         {
             var callback = string.Empty;
             if (request.Method == HttpMethod.Get)
@@ -74,15 +66,9 @@ namespace WebApi.OutputCache.V2
             return callback;
         }
 
-        private string GetValue(object val)
+        public virtual string GetValue(object val)
         {
-            if (val is IEnumerable && !(val is string))
-            {
-                var concatValue = string.Empty;
-                var paramArray = val as IEnumerable;
-                return paramArray.Cast<object>().Aggregate(concatValue, (current, paramValue) => current + (paramValue + ";"));
-            }
-            return val.ToString();
+            return BaseCacheKeyGenerator.GetValueStatic(val);
         }
     }
 }
