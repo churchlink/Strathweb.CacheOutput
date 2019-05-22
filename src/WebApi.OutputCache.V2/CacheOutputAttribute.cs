@@ -5,7 +5,6 @@ using System.Net.Http;
 using System.Net.Http.Formatting;
 using System.Net.Http.Headers;
 using System.Runtime.ExceptionServices;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -19,10 +18,10 @@ using WebApi.OutputCache.Core.Time;
 namespace WebApi.OutputCache.V2
 {
     [AttributeUsage(AttributeTargets.Method | AttributeTargets.Class, AllowMultiple = false, Inherited = true)]
-    public class CacheOutputAttribute : ActionFilterAttribute
+    public class CacheOutputAttribute : FilterAttribute, IActionFilter
     {
         private const string CurrentRequestMediaType = "CacheOutput:CurrentRequestMediaType";
-        protected static MediaTypeHeaderValue DefaultMediaType = new MediaTypeHeaderValue("application/json") {CharSet = Encoding.UTF8.HeaderName};
+        protected static MediaTypeHeaderValue DefaultMediaType = new MediaTypeHeaderValue("application/json");
 
         /// <summary>
         /// Cache enabled only for requests when Thread.CurrentPrincipal is not set
@@ -72,19 +71,72 @@ namespace WebApi.OutputCache.V2
         public bool NoCache { get; set; }
 
         /// <summary>
-        /// Corresponds to CacheControl Private HTTP header. Response can be cached by browser but not by intermediary cache
+        /// If true, the ETag will be an MD5 hash of the content.
+        /// Else Guid.NewGuid();
         /// </summary>
-        public bool Private { get; set; }
+        public bool HashContentForETag { get; set; }
 
+        string _cacheArgs;
         /// <summary>
-        /// Class used to generate caching keys
+        /// List the comma-separated, case-sensitive names of any simple type arguments in 
+        /// this method that you want to use for generating the basecachekey. For complex types 
+        /// with properties, implement ICacheKey on them in which case this attribute is not needed.
+        /// This library already uses any non-null action values on the method to generate 
+        /// separate cached responses,
+        /// so why is this needed? Because at invalidation time (e.g. when a cached response 
+        /// expires), it unfortunately invalidates ALL cached responses for this method, 
+        /// even though their action arguments are different (so even though separate 
+        /// cached responses were made for an action argument 'id=33' and another for 
+        /// 'id=34', if 'id=33' cache expires, it also deletes the 'id=34' cache and etc). 
+        /// In many cases this is what you want, particularly when the underlying resource 
+        /// being served up by this endpoint coorelates with a single collection. 
+        /// However, there are many cases where this is not true. In those cases,
+        /// this cache is largely worthless without this new feature. Why? Consider this example:
+        /// <para />
+        /// Example:
+        /// <example><code><![CDATA[
+        /// [CacheOutput(CacheArgs = "feedid")]
+        /// [HttpGet]
+        /// public HttpResponseMessage GetRSSFeed(int feedId = 0) { }
+        /// ]]></code>
+        /// Let's say this action endpoint, <c>GetRSSFeed</c>, serves up hundreds or 
+        /// thousands of different RSS feeds, totally different feeds depending on the 
+        /// feedid. Currently, a cache *IS* made for *each* of these feed responses, but
+        /// the problem is, when any of them get invalidated, it invalidates *all* of those
+        /// caches! With this attribute, the arg 'feedid' will be used in generating the 
+        /// basecachekey, which is the linchpin value used for grouping cached responses.
+        /// This will allow *only* the cached responses with the inputed feedid to be 
+        /// invalidated.
+        /// <para/>
+        /// Where is the basecachekey finally used? See here: IApiOutputCache.Add, 
+        /// which expects a <c>string dependsOnKey</c> argument, which is in fact
+        /// the basecachekey.
+        /// <para/>
+        /// Note: AutoInvalidateCacheOutputAttribute will not work for
+        /// action methods decorated with this attribute.
+        /// </example>
         /// </summary>
+        public string CacheArgs
+        {
+            get { return _cacheArgs; }
+            set
+            {
+                _cacheArgs = string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+                BaseKeyCacheArgs = _cacheArgs == null
+                    ? null
+                    : _cacheArgs.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+            }
+        }
+
+        public string[] BaseKeyCacheArgs { get; internal set; }
+
+        public CacheOutputAttribute()
+        {
+        }
+
         public Type CacheKeyGenerator { get; set; }
 
-        /// <summary>
-        /// If set to something else than an empty string, this value will always be used for the Content-Type header, regardless of content negotiation.
-        /// </summary>
-        public string MediaType { get; set; }
+        private MediaTypeHeaderValue _responseMediaType;
 
         // cache repository
         private IApiOutputCache _webApiCache;
@@ -96,9 +148,9 @@ namespace WebApi.OutputCache.V2
 
         internal IModelQuery<DateTime, CacheTime> CacheTimeQuery;
 
-        protected virtual bool IsCachingAllowed(HttpActionContext actionContext, bool anonymousOnly)
+        readonly Func<HttpActionContext, bool, bool> _isCachingAllowed = (ac, anonymous) =>
         {
-            if (anonymousOnly)
+            if (anonymous)
             {
                 if (Thread.CurrentPrincipal.Identity.IsAuthenticated)
                 {
@@ -106,13 +158,8 @@ namespace WebApi.OutputCache.V2
                 }
             }
 
-            if (actionContext.ActionDescriptor.GetCustomAttributes<IgnoreCacheOutputAttribute>().Any())
-            {
-                return false;
-            }
-
-            return actionContext.Request.Method == HttpMethod.Get;
-        }
+            return ac.Request.Method == HttpMethod.Get;
+        };
 
         protected virtual void EnsureCacheTimeQuery()
         {
@@ -126,38 +173,26 @@ namespace WebApi.OutputCache.V2
 
         protected virtual MediaTypeHeaderValue GetExpectedMediaType(HttpConfiguration config, HttpActionContext actionContext)
         {
-            if (!string.IsNullOrEmpty(MediaType))
-            {
-                return new MediaTypeHeaderValue(MediaType);
-            }
-
             MediaTypeHeaderValue responseMediaType = null;
 
             var negotiator = config.Services.GetService(typeof(IContentNegotiator)) as IContentNegotiator;
             var returnType = actionContext.ActionDescriptor.ReturnType;
 
-            if (negotiator != null && returnType != typeof(HttpResponseMessage) && (returnType != typeof(IHttpActionResult) || typeof(IHttpActionResult).IsAssignableFrom(returnType)))
+            if (negotiator != null && returnType != typeof(HttpResponseMessage))
             {
                 var negotiatedResult = negotiator.Negotiate(returnType, actionContext.Request, config.Formatters);
-
-                if (negotiatedResult == null)
-                {
-                    return DefaultMediaType;
-                }
-
                 responseMediaType = negotiatedResult.MediaType;
-                if (string.IsNullOrWhiteSpace(responseMediaType.CharSet))
-                {
-                    responseMediaType.CharSet = Encoding.UTF8.HeaderName;
-                }
+                responseMediaType.CharSet = Encoding.UTF8.HeaderName;
             }
             else
             {
                 if (actionContext.Request.Headers.Accept != null)
                 {
                     responseMediaType = actionContext.Request.Headers.Accept.FirstOrDefault();
-                    if (responseMediaType == null || !config.Formatters.Any(x => x.SupportedMediaTypes.Any(value => value.MediaType == responseMediaType.MediaType)))
+                    if (responseMediaType == null ||
+                         !config.Formatters.Any(x => x.SupportedMediaTypes.Contains(responseMediaType)))
                     {
+                        DefaultMediaType.CharSet = Encoding.UTF8.HeaderName;
                         return DefaultMediaType;
                     }
                 }
@@ -166,135 +201,140 @@ namespace WebApi.OutputCache.V2
             return responseMediaType;
         }
 
-        public override void OnActionExecuting(HttpActionContext actionContext)
+        private void OnActionExecuting(HttpActionContext actxt)
         {
-            if (actionContext == null) throw new ArgumentNullException("actionContext");
+            if (actxt == null) throw new ArgumentNullException("actxt");
 
-            if (!IsCachingAllowed(actionContext, AnonymousOnly)) return;
+            if (!_isCachingAllowed(actxt, AnonymousOnly)) return;
 
-            var config = actionContext.Request.GetConfiguration();
+            var config = actxt.Request.GetConfiguration();
 
             EnsureCacheTimeQuery();
-            EnsureCache(config, actionContext.Request);
+            EnsureCache(config, actxt.Request);
 
-            var cacheKeyGenerator = config.CacheOutputConfiguration().GetCacheKeyGenerator(actionContext.Request, CacheKeyGenerator);
+            var cacheKeyGenerator = config.CacheOutputConfiguration().GetCacheKeyGenerator(actxt.Request, CacheKeyGenerator);
 
-            var responseMediaType = GetExpectedMediaType(config, actionContext);
-            actionContext.Request.Properties[CurrentRequestMediaType] = responseMediaType;
-            var cachekey = cacheKeyGenerator.MakeCacheKey(actionContext, responseMediaType, ExcludeQueryStringFromCacheKey);
+            _responseMediaType = GetExpectedMediaType(config, actxt);
+            var cachekey = cacheKeyGenerator.MakeCacheKey(actxt, _responseMediaType, ExcludeQueryStringFromCacheKey, BaseKeyCacheArgs);
 
             if (!_webApiCache.Contains(cachekey)) return;
 
-            if (actionContext.Request.Headers.IfNoneMatch != null)
+            if (actxt.Request.Headers.IfNoneMatch != null)
             {
-                var etag = _webApiCache.Get<string>(cachekey + Constants.EtagKey);
+                var etag = _webApiCache.Get(cachekey + Constants.EtagKey) as string;
                 if (etag != null)
                 {
-                    if (actionContext.Request.Headers.IfNoneMatch.Any(x => x.Tag ==  etag))
+                    if (actxt.Request.Headers.IfNoneMatch.Any(x => x.Tag == etag))
                     {
                         var time = CacheTimeQuery.Execute(DateTime.Now);
-                        var quickResponse = actionContext.Request.CreateResponse(HttpStatusCode.NotModified);
+                        var quickResponse = actxt.Request.CreateResponse(HttpStatusCode.NotModified);
                         ApplyCacheHeaders(quickResponse, time);
-                        actionContext.Response = quickResponse;
+                        actxt.Response = quickResponse;
                         return;
                     }
                 }
             }
 
-            var val = _webApiCache.Get<byte[]>(cachekey);
+            var val = _webApiCache.Get(cachekey) as byte[];
             if (val == null) return;
 
-            var contenttype = _webApiCache.Get<MediaTypeHeaderValue>(cachekey + Constants.ContentTypeKey) ?? responseMediaType;
-            var contentGeneration = _webApiCache.Get<string>(cachekey + Constants.GenerationTimestampKey);
+            var contenttype = _webApiCache.Get(cachekey + Constants.ContentTypeKey) as string ?? cachekey.Split(':')[1];
 
-            DateTimeOffset? contentGenerationTimestamp = null;
-            if (contentGeneration != null)
-            {
-                if (DateTimeOffset.TryParse(contentGeneration, out DateTimeOffset parsedContentGenerationTimestamp))
-                {
-                    contentGenerationTimestamp = parsedContentGenerationTimestamp;
-                }
-            };
+            actxt.Response = actxt.Request.CreateResponse();
+            actxt.Response.Content = new ByteArrayContent(val);
 
-            actionContext.Response = actionContext.Request.CreateResponse();
-            actionContext.Response.Content = new ByteArrayContent(val);
-
-            actionContext.Response.Content.Headers.ContentType = contenttype;
-            var responseEtag = _webApiCache.Get<string>(cachekey + Constants.EtagKey);
-            if (responseEtag != null) SetEtag(actionContext.Response,  responseEtag);
+            actxt.Response.Content.Headers.ContentType = new MediaTypeHeaderValue(contenttype);
+            var responseEtag = _webApiCache.Get(cachekey + Constants.EtagKey) as string;
+            if (responseEtag != null) SetEtag(actxt.Response, responseEtag);
 
             var cacheTime = CacheTimeQuery.Execute(DateTime.Now);
-            ApplyCacheHeaders(actionContext.Response, cacheTime, contentGenerationTimestamp);
+            ApplyCacheHeaders(actxt.Response, cacheTime);
         }
 
-        public override async Task OnActionExecutedAsync(HttpActionExecutedContext actionExecutedContext, CancellationToken cancellationToken)
+        private async Task OnActionExecuted(HttpActionExecutedContext axctxt)
         {
-            if (actionExecutedContext.ActionContext.Response == null || !actionExecutedContext.ActionContext.Response.IsSuccessStatusCode) return;
+            var ctxt = axctxt.ActionContext;
+            if (ctxt.Response == null || !ctxt.Response.IsSuccessStatusCode) return;
 
-            if (!IsCachingAllowed(actionExecutedContext.ActionContext, AnonymousOnly)) return;
+            if (!_isCachingAllowed(ctxt, AnonymousOnly)) return;
 
-            var actionExecutionTimestamp = DateTimeOffset.Now;
-            var cacheTime = CacheTimeQuery.Execute(actionExecutionTimestamp.DateTime);
-            if (cacheTime.AbsoluteExpiration > actionExecutionTimestamp)
+            var cacheTime = CacheTimeQuery.Execute(DateTime.Now);
+            if (cacheTime.AbsoluteExpiration > DateTime.Now)
             {
-                var httpConfig = actionExecutedContext.Request.GetConfiguration();
-                var config = httpConfig.CacheOutputConfiguration();
-                var cacheKeyGenerator = config.GetCacheKeyGenerator(actionExecutedContext.Request, CacheKeyGenerator);
+                var config = axctxt.Request.GetConfiguration().CacheOutputConfiguration();
+                var cacheKeyGenerator = config.GetCacheKeyGenerator(axctxt.Request, CacheKeyGenerator);
 
-                var responseMediaType = actionExecutedContext.Request.Properties[CurrentRequestMediaType] as MediaTypeHeaderValue ?? GetExpectedMediaType(httpConfig, actionExecutedContext.ActionContext);
-                var cachekey = cacheKeyGenerator.MakeCacheKey(actionExecutedContext.ActionContext, responseMediaType, ExcludeQueryStringFromCacheKey);
+                string cachekey = cacheKeyGenerator.MakeCacheKey(ctxt, _responseMediaType, ExcludeQueryStringFromCacheKey, BaseKeyCacheArgs);
 
                 if (!string.IsNullOrWhiteSpace(cachekey) && !(_webApiCache.Contains(cachekey)))
                 {
-                    SetEtag(actionExecutedContext.Response, CreateEtag(actionExecutedContext, cachekey, cacheTime));
 
-                    var responseContent = actionExecutedContext.Response.Content;
+                    byte[] content = axctxt.Response.Content == null
+                        ? null
+                        : await axctxt.Response.Content.ReadAsByteArrayAsync();
 
-                    if (responseContent != null)
+                    string etag = !HashContentForETag || content.IsNulle()
+                        ? Guid.NewGuid().ToString()
+                        : GetMD5Hash(content);
+
+                    SetEtag(axctxt.Response, etag);
+
+                    if (axctxt.Response.Content != null)
                     {
-                        var baseKey = config.MakeBaseCachekey(actionExecutedContext.ActionContext.ControllerContext.ControllerDescriptor.ControllerType.FullName, actionExecutedContext.ActionContext.ActionDescriptor.ActionName);
-                        var contentType = responseContent.Headers.ContentType;
-                        string etag = actionExecutedContext.Response.Headers.ETag.Tag;
-                        //ConfigureAwait false to avoid deadlocks
-                        var content = await responseContent.ReadAsByteArrayAsync().ConfigureAwait(false);
-
-                        responseContent.Headers.Remove("Content-Length");
+                        string baseKey = BaseCacheKeyGeneratorWebApi.GetKey(ctxt, BaseKeyCacheArgs);
 
                         _webApiCache.Add(baseKey, string.Empty, cacheTime.AbsoluteExpiration);
                         _webApiCache.Add(cachekey, content, cacheTime.AbsoluteExpiration, baseKey);
 
-                       
                         _webApiCache.Add(cachekey + Constants.ContentTypeKey,
-                                        contentType,
+                                        axctxt.Response.Content.Headers.ContentType.MediaType,
                                         cacheTime.AbsoluteExpiration, baseKey);
 
-                       
                         _webApiCache.Add(cachekey + Constants.EtagKey,
-                                        etag,
-                                        cacheTime.AbsoluteExpiration, baseKey);
-
-
-                        _webApiCache.Add(cachekey + Constants.GenerationTimestampKey,
-                                        actionExecutionTimestamp.ToString(),
+                                        axctxt.Response.Headers.ETag.Tag,
                                         cacheTime.AbsoluteExpiration, baseKey);
                     }
                 }
             }
-
-            ApplyCacheHeaders(actionExecutedContext.ActionContext.Response, cacheTime, actionExecutionTimestamp);
+            ApplyCacheHeaders(ctxt.Response, cacheTime);
         }
 
-        protected virtual void ApplyCacheHeaders(HttpResponseMessage response, CacheTime cacheTime, DateTimeOffset? contentGenerationTimestamp = null)
+        static TimeSpan md5HashTimeSec;
+
+        /// <summary>
+        /// Returns an MD5 hash of data converted to a Base64 string.
+        /// What to do if content / data was null or empty? 
+        /// Currently, we are not calling this if that is the case, are 
+        /// generating a NewGuid(), because returning Guid.Empty could
+        /// make resources confused with regard to their headers being 
+        /// different headers but both empty content. But maybe that 
+        /// would be fine? For now, we're bypassing the issue, empty
+        /// content returns a new random Guid (Guid.NewGuid());
+        /// </summary>
+        /// <param name="data">Data. If null, will be converted to an
+        /// empty array before converting.</param>
+        public static string GetMD5Hash(byte[] data)
         {
-            if (cacheTime.ClientTimeSpan > TimeSpan.Zero || MustRevalidate || Private)
+            string result = null;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            if (data == null) data = new byte[0];
+            using (var md5 = System.Security.Cryptography.MD5.Create())
+            {
+                result = Convert.ToBase64String(md5.ComputeHash(data));
+            }
+            md5HashTimeSec = sw.Elapsed;
+            return result;
+        }
+
+        private void ApplyCacheHeaders(HttpResponseMessage response, CacheTime cacheTime)
+        {
+            if (cacheTime.ClientTimeSpan > TimeSpan.Zero || MustRevalidate)
             {
                 var cachecontrol = new CacheControlHeaderValue
-                                       {
-                                           MaxAge = cacheTime.ClientTimeSpan,
-                                           SharedMaxAge = cacheTime.SharedTimeSpan,
-                                           MustRevalidate = MustRevalidate,
-                                           Private = Private
-                                       };
+                {
+                    MaxAge = cacheTime.ClientTimeSpan,
+                    MustRevalidate = MustRevalidate
+                };
 
                 response.Headers.CacheControl = cachecontrol;
             }
@@ -303,15 +343,6 @@ namespace WebApi.OutputCache.V2
                 response.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true };
                 response.Headers.Add("Pragma", "no-cache");
             }
-            if ((response.Content != null) && contentGenerationTimestamp.HasValue)
-            {
-                response.Content.Headers.LastModified = contentGenerationTimestamp.Value;
-            }
-        }
-
-        protected virtual string CreateEtag(HttpActionExecutedContext actionExecutedContext, string cachekey, CacheTime cacheTime)
-        {
-            return Guid.NewGuid().ToString();
         }
 
         private static void SetEtag(HttpResponseMessage message, string etag)
@@ -322,5 +353,67 @@ namespace WebApi.OutputCache.V2
                 message.Headers.ETag = eTag;
             }
         }
+
+        Task<HttpResponseMessage> IActionFilter.ExecuteActionFilterAsync(HttpActionContext actionContext, CancellationToken cancellationToken, Func<Task<HttpResponseMessage>> continuation)
+        {
+            if (actionContext == null)
+            {
+                throw new ArgumentNullException("actionContext");
+            }
+
+            if (continuation == null)
+            {
+                throw new ArgumentNullException("continuation");
+            }
+
+            OnActionExecuting(actionContext);
+
+            if (actionContext.Response != null)
+            {
+                return Task.FromResult(actionContext.Response);
+            }
+
+            return CallOnActionExecutedAsync(actionContext, cancellationToken, continuation);
+        }
+
+        private async Task<HttpResponseMessage> CallOnActionExecutedAsync(HttpActionContext actionContext, CancellationToken cancellationToken, Func<Task<HttpResponseMessage>> continuation)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            HttpResponseMessage response = null;
+            Exception exception = null;
+            try
+            {
+                response = await continuation();
+            }
+            catch (Exception e)
+            {
+                exception = e;
+            }
+
+            try
+            {
+                var executedContext = new HttpActionExecutedContext(actionContext, exception) { Response = response };
+                await OnActionExecuted(executedContext);
+
+                if (executedContext.Response != null)
+                {
+                    return executedContext.Response;
+                }
+
+                if (executedContext.Exception != null)
+                {
+                    ExceptionDispatchInfo.Capture(executedContext.Exception).Throw();
+                }
+            }
+            catch (Exception e)
+            {
+                actionContext.Response = null;
+                ExceptionDispatchInfo.Capture(e).Throw();
+            }
+
+            throw new InvalidOperationException(GetType().Name);
+        }
+
     }
-} 
+}
