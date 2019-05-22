@@ -8,7 +8,7 @@ namespace WebApi.OutputCache.Core.Time
         private readonly int clientTimeInSeconds;
         private readonly int? sharedTimeInSecounds;
 
-        public ShortTime(int serverTimeInSeconds, int clientTimeInSeconds, int? sharedTimeInSecounds)
+        public ShortTime(int serverTimeInSeconds, int clientTimeInSeconds, int? sharedTimeInSecounds = null)
         {
             if (serverTimeInSeconds < 0)
                 serverTimeInSeconds = 0;
